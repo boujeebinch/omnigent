@@ -6,12 +6,15 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import tomllib
+
+from omnigent.codex_native_state import _codex_native_state_root
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -44,7 +47,7 @@ _MCP_CONFIG_FILE = "bridge.json"
 # prep time (the Omnigent URL + auth do not change across thread rotations),
 # whereas ``state.json`` mutates on every turn/thread change.
 _POLICY_HOOK_FILE = "policy_hook.json"
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
+_BRIDGE_ROOT: Path | None = None
 
 
 def bridge_root() -> Path:
@@ -56,7 +59,7 @@ def bridge_root() -> Path:
     :returns: Absolute root for Codex-native bridge directories, e.g.
         ``Path("~/.omnigent/codex-native")``.
     """
-    return _BRIDGE_ROOT
+    return _BRIDGE_ROOT if _BRIDGE_ROOT is not None else _codex_native_state_root()
 
 
 @dataclass(frozen=True)
@@ -92,7 +95,7 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
         ``~/.omnigent/codex-native``.
     """
     digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
-    return _BRIDGE_ROOT / digest
+    return bridge_root() / digest
 
 
 def build_codex_native_spawn_env(
@@ -261,7 +264,23 @@ def socket_path_for_bridge_dir(bridge_dir: Path) -> Path:
     :param bridge_dir: Native Codex bridge directory.
     :returns: Absolute Unix socket path for the app-server.
     """
-    return bridge_dir / "app-server.sock"
+    path = bridge_dir / "app-server.sock"
+    if len(os.fsencode(path)) <= 103:
+        return path
+    # Durable run roots can exceed sockaddr_un.sun_path. Only the transport
+    # endpoint uses this short, private runtime directory; state stays durable.
+    root = Path("/tmp").resolve() / f"omnigent-codex-sockets-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (
+        root.resolve() != root
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        raise ValueError("Codex socket directory must be private and owned")
+    digest = hashlib.sha256(os.fsencode(bridge_dir.absolute())).hexdigest()[:32]
+    return root / f"{digest}.sock"
 
 
 def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:

@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
+    bridge_root,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     clear_bridge_state,
@@ -26,6 +27,34 @@ from omnigent.codex_native_bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
+
+
+def test_bridge_and_resume_state_share_configured_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed native sessions keep bridges and resume state in the same owner scope."""
+    from omnigent.codex_native_state import read_launch_state, write_launch_state
+
+    root = tmp_path / "owned-native"
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(root))
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", None)
+    directory = prepare_bridge_dir("owned-session")
+    write_launch_state("owned-session", str(tmp_path))
+    assert bridge_root() == root
+    assert directory.parent == root
+    assert codex_home_for_bridge_dir(directory).is_relative_to(root)
+    assert read_launch_state("owned-session").working_directory == str(tmp_path)
+
+
+def test_bridge_root_observes_override_after_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Importing the module does not freeze a previous session's storage root."""
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", None)
+    for name in ("first", "second"):
+        root = tmp_path / name
+        monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(root))
+        assert prepare_bridge_dir("session").parent == root
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -324,3 +353,22 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     clear_bridge_state(bridge_dir)
 
     assert read_mcp_startup(bridge_dir) == {}
+
+
+def test_long_durable_root_uses_short_private_socket(tmp_path: Path) -> None:
+    import os
+    import socket
+
+    from omnigent.codex_native_bridge import socket_path_for_bridge_dir
+
+    bridge = tmp_path / ("long-owned-run-" * 12)
+    path = socket_path_for_bridge_dir(bridge)
+    assert len(os.fsencode(path)) <= 103
+    assert path == socket_path_for_bridge_dir(bridge)
+    assert path != socket_path_for_bridge_dir(bridge / "other")
+    assert path.parent.stat().st_mode & 0o077 == 0
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        try:
+            server.bind(str(path))
+        finally:
+            path.unlink(missing_ok=True)
